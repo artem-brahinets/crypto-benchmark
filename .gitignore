@@ -13,3 +13,4 @@ __pycache__/
 *.sqlite3
 
 benchmark/results/*.csv
+benchmark/results/*.png
