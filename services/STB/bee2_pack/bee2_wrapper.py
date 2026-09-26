@@ -1,225 +1,156 @@
-import atexit
-import concurrent.futures
-import threading
+import os
 import time
 
-_crypto_pool = None
-_pool_lock = threading.Lock()
-
-
-def _get_pool():
-    global _crypto_pool
-
-    if _crypto_pool is None:
-        with _pool_lock:
-            if _crypto_pool is None:
-                _crypto_pool = concurrent.futures.ProcessPoolExecutor(
-                    max_workers=1
-                )
-                atexit.register(_shutdown_pool)
-
-    return _crypto_pool
-
-
-def _shutdown_pool():
-    global _crypto_pool
-
-    if _crypto_pool is not None:
-        _crypto_pool.shutdown(wait=True)
-        _crypto_pool = None
+KEY_LEN = 32
+IV_LEN = 16
+MAC_LEN = 8
 
 
 def _to_octet(bee2_lib, data: bytes):
-    vp = bee2_lib.memAlloc(len(data))
+    size = len(data) if data else 1
+    vp = bee2_lib.memAlloc(size)
 
     if data:
-        bee2_lib.bee2_memmove(
-            vp,
-            data,
-            len(data)
+        bee2_lib.bee2_memmove(vp, data, len(data))
+
+    return vp, bee2_lib.vp2op(vp)
+
+
+def _check_err(value, func_name: str) -> int:
+
+    if not isinstance(value, int):
+        raise RuntimeError(
+            f"{func_name}: SWIG вернул {type(value).__name__} вместо int. "
+            "Пересоберите биндинг или добавьте явный typemap в .i-файл."
         )
-
-    op = bee2_lib.vp2op(vp)
-
-    return vp, op
+    return value
 
 
-def _worker_hash256(data: bytes) -> bytes:
+def hash256(data: bytes) -> bytes:
     from . import bee2_lib
 
     if not data:
         return b"\x00" * 32
 
-    data_vp, _ = _to_octet(bee2_lib, data)
+    src_vp, src_op = _to_octet(bee2_lib, data)
     hash_vp = bee2_lib.memAlloc(32)
     hash_op = bee2_lib.vp2op(hash_vp)
 
     try:
-        err = bee2_lib.bashHash(
-            hash_op,
-            256,
-            data_vp,
-            len(data),
-        )
-
+        err = _check_err(bee2_lib.beltHash(hash_op, src_op, len(data)), "beltHash")
         if err != 0:
-            raise RuntimeError(f"bashHash error: {err}")
-
-        return bee2_lib.bee2_get_bytes(
-            hash_vp,
-            32
-        )
-
+            raise RuntimeError(f"beltHash error: {err}")
+        return bee2_lib.bee2_get_bytes(hash_vp, 32)
     finally:
-        bee2_lib.memFree(data_vp)
+        bee2_lib.memFree(src_vp)
         bee2_lib.memFree(hash_vp)
 
 
-def _worker_encrypt(data: bytes, key: bytes) -> tuple[bytes, float]:
+def encrypt(
+    data: bytes,
+    key: bytes,
+    aad: bytes = b"",
+    iv: bytes | None = None,
+) -> tuple[bytes, bytes, bytes, float]:
+
     from . import bee2_lib
 
-    if not data:
-        return b"", 0.0
+    if len(key) != KEY_LEN:
+        raise ValueError(f"key must be {KEY_LEN} bytes, got {len(key)}")
 
-    if len(key) != 32:
-        raise ValueError("key must be 32 bytes")
+    if iv is None:
+        iv = os.urandom(IV_LEN)
+    elif len(iv) != IV_LEN:
+        raise ValueError(f"iv must be {IV_LEN} bytes, got {len(iv)}")
 
-    state = bee2_lib.memAlloc(
-        bee2_lib.bashPrg_keep()
-    )
+    dest_vp = bee2_lib.memAlloc(len(data) if data else 1)
+    dest_op = bee2_lib.vp2op(dest_vp)
 
-    key_vp, key_op = _to_octet(
-        bee2_lib,
-        key
-    )
+    src1_vp, src1_op = _to_octet(bee2_lib, data)
+    src2_vp, src2_op = _to_octet(bee2_lib, aad)
+    key_vp, key_op = _to_octet(bee2_lib, key)
+    iv_vp, iv_op = _to_octet(bee2_lib, iv)
 
-    buf_vp, _ = _to_octet(
-        bee2_lib,
-        data
-    )
+    mac_vp = bee2_lib.memAlloc(MAC_LEN)
+    mac_op = bee2_lib.vp2op(mac_vp)
 
     try:
-        bee2_lib.bashPrgStart(
-            state,
-            256,
-            1,
-            None,
-            0,
-            key_op,
-            len(key),
-        )
-
-        bee2_lib.bashPrgEncrStart(state)
-
         start = time.perf_counter()
-
-        bee2_lib.bashPrgEncr(
-            buf_vp,
-            len(data),
-            state,
+        err = bee2_lib.beltDWPWrap(
+            dest_op, mac_op,
+            src1_op, len(data),
+            src2_op, len(aad),
+            key_op, len(key),
+            iv_op,
         )
+        elapsed_ms = (time.perf_counter() - start) * 1000
 
-        end = time.perf_counter()
+        err = _check_err(err, "beltDWPWrap")
+        if err != 0:
+            raise RuntimeError(f"beltDWPWrap error: {err}")
 
-        encrypted = bee2_lib.bee2_get_bytes(
-            buf_vp,
-            len(data)
-        )
+        ciphertext = bee2_lib.bee2_get_bytes(dest_vp, len(data)) if data else b""
+        mac = bee2_lib.bee2_get_bytes(mac_vp, MAC_LEN)
 
-        return encrypted, (end - start) * 1000
+        return ciphertext, mac, iv, elapsed_ms
 
     finally:
-        bee2_lib.memFree(state)
-        bee2_lib.memFree(key_vp)
-        bee2_lib.memFree(buf_vp)
+        for vp in (dest_vp, src1_vp, src2_vp, key_vp, iv_vp, mac_vp):
+            bee2_lib.memFree(vp)
 
 
-def _worker_decrypt(data: bytes, key: bytes) -> tuple[bytes, float]:
+def decrypt(
+    data: bytes,
+    key: bytes,
+    mac: bytes,
+    iv: bytes,
+    aad: bytes = b"",
+) -> tuple[bytes, float]:
+
     from . import bee2_lib
 
-    if not data:
-        return b"", 0.0
+    if len(key) != KEY_LEN:
+        raise ValueError(f"key must be {KEY_LEN} bytes, got {len(key)}")
+    if len(mac) != MAC_LEN:
+        raise ValueError(f"mac must be {MAC_LEN} bytes, got {len(mac)}")
+    if len(iv) != IV_LEN:
+        raise ValueError(f"iv must be {IV_LEN} bytes, got {len(iv)}")
 
-    if len(key) != 32:
-        raise ValueError("key must be 32 bytes")
+    dest_vp = bee2_lib.memAlloc(len(data) if data else 1)
+    dest_op = bee2_lib.vp2op(dest_vp)
 
-    state = bee2_lib.memAlloc(
-        bee2_lib.bashPrg_keep()
-    )
-
-    key_vp, key_op = _to_octet(
-        bee2_lib,
-        key
-    )
-
-    buf_vp, _ = _to_octet(
-        bee2_lib,
-        data
-    )
+    src1_vp, src1_op = _to_octet(bee2_lib, data)
+    src2_vp, src2_op = _to_octet(bee2_lib, aad)
+    mac_vp, mac_op = _to_octet(bee2_lib, mac)
+    key_vp, key_op = _to_octet(bee2_lib, key)
+    iv_vp, iv_op = _to_octet(bee2_lib, iv)
 
     try:
-        bee2_lib.bashPrgStart(
-            state,
-            256,
-            1,
-            None,
-            0,
-            key_op,
-            len(key),
-        )
-
-        bee2_lib.bashPrgDecrStart(state)
-
         start = time.perf_counter()
-
-        bee2_lib.bashPrgDecr(
-            buf_vp,
-            len(data),
-            state,
+        err = bee2_lib.beltDWPUnwrap(
+            dest_op,
+            src1_op, len(data),
+            src2_op, len(aad),
+            mac_op,
+            key_op, len(key),
+            iv_op,
         )
+        elapsed_ms = (time.perf_counter() - start) * 1000
 
-        end = time.perf_counter()
+        err = _check_err(err, "beltDWPUnwrap")
+        if err != 0:
+            raise IntegrityError(
+                f"belt-dwp: проверка имитовставки не пройдена (err={err})"
+            )
 
-        decrypted = bee2_lib.bee2_get_bytes(
-            buf_vp,
-            len(data)
-        )
+        plaintext = bee2_lib.bee2_get_bytes(dest_vp, len(data)) if data else b""
 
-        return decrypted, (end - start) * 1000
+        return plaintext, elapsed_ms
 
     finally:
-        bee2_lib.memFree(state)
-        bee2_lib.memFree(key_vp)
-        bee2_lib.memFree(buf_vp)
+        for vp in (dest_vp, src1_vp, src2_vp, mac_vp, key_vp, iv_vp):
+            bee2_lib.memFree(vp)
 
 
-def hash256(data: bytes) -> bytes:
-    pool = _get_pool()
-    future = pool.submit(
-        _worker_hash256,
-        data
-    )
-
-    return future.result(timeout=60)
-
-
-def encrypt(data: bytes, key: bytes) -> tuple[bytes, float]:
-    pool = _get_pool()
-    future = pool.submit(
-        _worker_encrypt,
-        data,
-        key
-    )
-
-    return future.result(timeout=60)
-
-
-def decrypt(data: bytes, key: bytes) -> tuple[bytes, float]:
-    pool = _get_pool()
-    future = pool.submit(
-        _worker_decrypt,
-        data,
-        key
-    )
-
-    return future.result(timeout=60)
+class IntegrityError(ValueError):
+    """Имитовставка не сошлась: данные повреждены, подделаны или ключ неверен."""

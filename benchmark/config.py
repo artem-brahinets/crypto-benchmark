@@ -6,7 +6,7 @@ SERVICES = {
     "STB": os.getenv("STB_URL", "http://127.0.0.1:8001"),
 }
 
-NUM_RUNS = 1
+NUM_RUNS = 5
 NUM_PHOTOS = 1000
 PHOTO_SIZE = 100 * 1024
 TIMEOUT = 60

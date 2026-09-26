@@ -6,6 +6,9 @@ import time
 from bee2_pack.bee2_wrapper import encrypt, decrypt, hash256
 from database.db import save_photo, get_photo, save_key, get_key
 
+IV_LEN = 16
+MAC_LEN = 8
+
 
 def generate_key() -> bytes:
     return secrets.token_bytes(32)
@@ -22,10 +25,12 @@ def upload_photo(photo_base64: str):
 
     key = generate_key()
 
-    encrypted_photo, crypto_time_ms = encrypt(
+    ciphertext, mac, iv, crypto_time_ms = encrypt(
         photo_bytes,
         key
     )
+
+    encrypted_photo = iv + mac + ciphertext
 
     save_photo(
         photo_id,
@@ -54,13 +59,20 @@ def upload_photo(photo_base64: str):
 def download_photo(photo_id: str):
     start_download_time = time.perf_counter()
 
-    encrypted_photo, saved_hash = get_photo(photo_id)
+    stored_blob, saved_hash = get_photo(photo_id)
 
-    if encrypted_photo is None:
+    if stored_blob is None:
         raise ValueError("Photo not found")
 
     if saved_hash is None:
         raise ValueError("Hash not found")
+
+    if len(stored_blob) < IV_LEN + MAC_LEN:
+        raise ValueError("Corrupted photo record")
+
+    iv = stored_blob[:IV_LEN]
+    mac = stored_blob[IV_LEN:IV_LEN + MAC_LEN]
+    ciphertext = stored_blob[IV_LEN + MAC_LEN:]
 
     key = get_key(photo_id)
 
@@ -68,8 +80,10 @@ def download_photo(photo_id: str):
         raise ValueError("Key not found")
 
     photo_bytes, decrypt_time_ms = decrypt(
-        encrypted_photo,
-        key
+        ciphertext,
+        key,
+        mac,
+        iv
     )
 
     check_hash = hash256(photo_bytes)
